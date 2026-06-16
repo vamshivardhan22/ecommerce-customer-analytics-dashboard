@@ -6,16 +6,16 @@ import pandas as pd
 import seaborn as sns
 import streamlit as st
 
-from scripts.seed_data import OUTPUT, main as seed_data
 
+DATA_PATH = Path("data/ecommerce_orders.csv")
 
 st.set_page_config(page_title="E-Commerce Analytics", layout="wide")
 
 
-def ensure_data():
-    if not OUTPUT.exists():
-        seed_data()
-    orders = pd.read_csv(OUTPUT, parse_dates=["order_date"])
+@st.cache_data
+def load_orders():
+    orders = pd.read_csv(DATA_PATH, parse_dates=["invoice_date"])
+    orders["invoice_month"] = orders["invoice_date"].dt.to_period("M").astype(str)
     return orders
 
 
@@ -30,111 +30,148 @@ def build_connection(orders):
 
 
 def customer_segments(orders):
-    snapshot = orders["order_date"].max() + pd.Timedelta(days=1)
+    snapshot = orders["invoice_date"].max() + pd.Timedelta(days=1)
     rfm = orders.groupby("customer_id").agg(
-        recency=("order_date", lambda x: (snapshot - x.max()).days),
-        frequency=("order_id", "nunique"),
-        monetary=("sales", "sum"),
-        profit=("profit", "sum"),
+        recency=("invoice_date", lambda x: (snapshot - x.max()).days),
+        frequency=("invoice_no", "nunique"),
+        monetary=("revenue", "sum"),
+        estimated_profit=("estimated_profit", "sum"),
     )
-    rfm["segment"] = pd.cut(
-        rfm["monetary"],
-        bins=[-1, 250, 700, 1400, float("inf")],
+    rfm["value_segment"] = pd.qcut(
+        rfm["monetary"].rank(method="first"),
+        q=4,
         labels=["Low Value", "Developing", "Loyal", "VIP"],
+    )
+    rfm["retention_segment"] = pd.cut(
+        rfm["recency"],
+        bins=[-1, 30, 90, 180, 9999],
+        labels=["Active", "Warm", "At Risk", "Dormant"],
     )
     return rfm.reset_index()
 
 
 def bar_chart(data, x, y, title):
     fig, ax = plt.subplots(figsize=(8, 4))
-    sns.barplot(data=data, x=x, y=y, ax=ax, palette="crest")
+    sns.barplot(data=data, x=x, y=y, hue=x, ax=ax, palette="viridis", legend=False)
     ax.set_title(title)
     ax.set_xlabel("")
     ax.set_ylabel("")
-    plt.xticks(rotation=20)
+    plt.xticks(rotation=25, ha="right")
     st.pyplot(fig, clear_figure=True)
 
 
-orders = ensure_data()
+orders = load_orders()
 conn = build_connection(orders)
-segments = customer_segments(orders)
 
 st.title("E-Commerce Customer Analytics Dashboard")
-st.caption("CEO-ready view of revenue, profit, customers, segments, and repeat purchase behavior.")
+st.caption(
+    "Executive dashboard built on the UCI Online Retail dataset. "
+    "Profit is estimated because the source dataset does not include cost of goods sold."
+)
 
 with st.sidebar:
     st.header("Filters")
-    min_date, max_date = orders["order_date"].min(), orders["order_date"].max()
-    date_range = st.date_input("Order date range", value=(min_date, max_date))
-    selected_regions = st.multiselect("Region", sorted(orders["region"].unique()), default=sorted(orders["region"].unique()))
-    selected_segments = st.multiselect("Customer segment", sorted(orders["segment"].unique()), default=sorted(orders["segment"].unique()))
+    min_date, max_date = orders["invoice_date"].dt.date.min(), orders["invoice_date"].dt.date.max()
+    date_range = st.date_input("Invoice date range", value=(min_date, max_date))
+    countries = st.multiselect(
+        "Country",
+        sorted(orders["country"].unique()),
+        default=["United Kingdom"] if "United Kingdom" in set(orders["country"]) else sorted(orders["country"].unique())[:5],
+    )
+    categories = st.multiselect(
+        "Product category",
+        sorted(orders["product_category"].unique()),
+        default=sorted(orders["product_category"].unique()),
+    )
 
 filtered = orders[
-    (orders["order_date"].dt.date >= date_range[0])
-    & (orders["order_date"].dt.date <= date_range[1])
-    & (orders["region"].isin(selected_regions))
-    & (orders["segment"].isin(selected_segments))
+    (orders["invoice_date"].dt.date >= date_range[0])
+    & (orders["invoice_date"].dt.date <= date_range[1])
+    & (orders["country"].isin(countries))
+    & (orders["product_category"].isin(categories))
 ]
 
-repeat_customers = filtered.groupby("customer_id")["order_id"].nunique()
-revenue = filtered["sales"].sum()
-profit = filtered["profit"].sum()
-aov = revenue / max(filtered["order_id"].nunique(), 1)
-clv = filtered.groupby("customer_id")["sales"].sum().mean()
-repeat_rate = (repeat_customers.gt(1).mean() * 100) if len(repeat_customers) else 0
+customer_orders = filtered.groupby("customer_id")["invoice_no"].nunique()
+revenue = filtered["revenue"].sum()
+estimated_profit = filtered["estimated_profit"].sum()
+orders_count = filtered["invoice_no"].nunique()
+customers_count = filtered["customer_id"].nunique()
+aov = revenue / max(orders_count, 1)
+clv = filtered.groupby("customer_id")["revenue"].sum().mean()
+repeat_rate = customer_orders.gt(1).mean() * 100 if len(customer_orders) else 0
 
-k1, k2, k3, k4, k5 = st.columns(5)
+k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Revenue", money(revenue))
-k2.metric("Profit", money(profit))
-k3.metric("Avg Order Value", money(aov))
-k4.metric("Avg CLV", money(clv))
-k5.metric("Repeat Rate", f"{repeat_rate:.1f}%")
+k2.metric("Est. Profit", money(estimated_profit))
+k3.metric("Orders", f"{orders_count:,}")
+k4.metric("Customers", f"{customers_count:,}")
+k5.metric("AOV", money(aov))
+k6.metric("Repeat Rate", f"{repeat_rate:.1f}%")
 
-tab_overview, tab_customers, tab_sql = st.tabs(["Executive Overview", "Customer Segments", "SQL Evidence"])
+tab_overview, tab_customers, tab_products, tab_sql = st.tabs(
+    ["Executive Overview", "Customer Segments", "Product Mix", "SQL Evidence"]
+)
 
 with tab_overview:
+    monthly = filtered.groupby("invoice_month", as_index=False)[["revenue", "estimated_profit"]].sum()
     left, right = st.columns(2)
-    monthly = filtered.assign(month=filtered["order_date"].dt.to_period("M").astype(str)).groupby("month", as_index=False)[["sales", "profit"]].sum()
     with left:
-        st.subheader("Revenue and Profit Trend")
-        st.line_chart(monthly, x="month", y=["sales", "profit"], height=320)
+        st.subheader("Revenue and Estimated Profit Trend")
+        st.line_chart(monthly, x="invoice_month", y=["revenue", "estimated_profit"], height=320)
     with right:
-        st.subheader("Revenue by Category")
-        category = filtered.groupby("category", as_index=False)["sales"].sum().sort_values("sales", ascending=False)
-        bar_chart(category, "category", "sales", "Revenue by Category")
-
-    region = filtered.groupby("region", as_index=False)[["sales", "profit"]].sum().sort_values("sales", ascending=False)
-    st.subheader("Regional Performance")
-    st.dataframe(region, use_container_width=True, hide_index=True)
+        st.subheader("Top Countries by Revenue")
+        country = filtered.groupby("country", as_index=False)["revenue"].sum().nlargest(10, "revenue")
+        bar_chart(country, "country", "revenue", "Revenue by Country")
 
 with tab_customers:
-    filtered_segments = customer_segments(filtered)
-    c1, c2 = st.columns([0.45, 0.55])
-    with c1:
-        st.subheader("Customer Value Segmentation")
-        seg_summary = filtered_segments.groupby("segment", observed=True).agg(
+    segments = customer_segments(filtered)
+    left, right = st.columns([0.42, 0.58])
+    with left:
+        st.subheader("RFM Customer Segments")
+        seg_summary = segments.groupby(["value_segment", "retention_segment"], observed=True).agg(
             customers=("customer_id", "count"),
             revenue=("monetary", "sum"),
-            profit=("profit", "sum"),
+            estimated_profit=("estimated_profit", "sum"),
         ).reset_index()
-        st.dataframe(seg_summary, use_container_width=True, hide_index=True)
-    with c2:
+        st.dataframe(seg_summary, width="stretch", hide_index=True)
+    with right:
         st.subheader("Top Customers by Lifetime Value")
-        top = filtered_segments.sort_values("monetary", ascending=False).head(15)
-        st.dataframe(top, use_container_width=True, hide_index=True)
+        top = segments.sort_values("monetary", ascending=False).head(20)
+        st.dataframe(top, width="stretch", hide_index=True)
+
+with tab_products:
+    st.subheader("Category Performance")
+    category = filtered.groupby("product_category", as_index=False).agg(
+        revenue=("revenue", "sum"),
+        estimated_profit=("estimated_profit", "sum"),
+        units=("quantity", "sum"),
+        orders=("invoice_no", "nunique"),
+    ).sort_values("revenue", ascending=False)
+    st.dataframe(category, width="stretch", hide_index=True)
+
+    st.subheader("Top Products")
+    products = filtered.groupby(["stock_code", "description"], as_index=False).agg(
+        revenue=("revenue", "sum"),
+        units=("quantity", "sum"),
+        customers=("customer_id", "nunique"),
+    ).sort_values("revenue", ascending=False).head(25)
+    st.dataframe(products, width="stretch", hide_index=True)
 
 with tab_sql:
     st.subheader("SQL KPI Queries")
     st.code(Path("sql/business_kpis.sql").read_text(encoding="utf-8"), language="sql")
-    st.subheader("Top Customer CLV from SQLite")
+    st.subheader("Top CLV Customers from SQLite")
     top_sql = pd.read_sql_query(
         """
-        SELECT customer_id, ROUND(SUM(sales), 2) AS clv, COUNT(DISTINCT order_id) AS orders
+        SELECT customer_id,
+               ROUND(SUM(revenue), 2) AS customer_lifetime_value,
+               COUNT(DISTINCT invoice_no) AS orders,
+               MAX(country) AS country
         FROM orders
         GROUP BY customer_id
-        ORDER BY clv DESC
-        LIMIT 10
+        ORDER BY customer_lifetime_value DESC
+        LIMIT 15
         """,
         conn,
     )
-    st.dataframe(top_sql, use_container_width=True, hide_index=True)
+    st.dataframe(top_sql, width="stretch", hide_index=True)
